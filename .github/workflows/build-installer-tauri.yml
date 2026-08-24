@@ -1,14 +1,21 @@
 name: Build Installer (Tauri)
 
-# Builds the Windows x64 controller-pack installer and publishes the Tauri
-# auto-update artifacts (signed NSIS installer + latest.json) on release,
-# or uploads them as workflow artifacts on manual dispatch.
+# Builds the controller-pack installer for Windows x64 and macOS (universal)
+# and publishes the Tauri auto-update artifacts (signed NSIS installer, signed
+# .app.tar.gz + .dmg, and a single latest.json covering both platforms) on
+# release, or uploads them as workflow artifacts on manual dispatch.
 #
 # Auto-updates require these repository secrets:
 #   TAURI_SIGNING_PRIVATE_KEY           the Tauri updater private key
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  its password (empty string if none)
 # and the matching public key in installer/src-tauri/tauri.conf.json
 # (plugins.updater.pubkey). Generate the keypair with `bun tauri signer generate`.
+#
+# macOS code signing / notarization is OPTIONAL — without the secrets below the
+# app still builds and updates, it is just unsigned (users must right-click →
+# Open once, see installer/RELEASE.md):
+#   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
+#   APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID       (notarization, needs the above)
 
 on:
   push:
@@ -42,19 +49,25 @@ jobs:
         run: cargo test -p controller-pack-core --verbose
 
   smoke-build:
-    name: Linux smoke build
-    # Only run smoke build on PRs and pushes (saves time/cost on manual triggers & releases)
+    name: Smoke build (${{ matrix.os }})
+    # Only run smoke builds on PRs and pushes (saves time/cost on manual triggers & releases)
     if: github.event_name == 'push' || github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     needs: core-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: installer
+          key: ${{ matrix.os }}
       - uses: oven-sh/setup-bun@v2
       - name: Install Linux system deps
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -72,6 +85,12 @@ jobs:
       - name: Rust check (Tauri crate)
         working-directory: installer/src-tauri
         run: cargo check --all-targets
+      # The core tests cover the non-Windows path handling (Wine-bottle pack
+      # detection, `\`-separated archive entries), so run them on a real mac too.
+      - name: Core tests
+        if: runner.os == 'macOS'
+        working-directory: installer
+        run: cargo test -p controller-pack-core
 
   release-build:
     name: Windows x64 installer
@@ -115,4 +134,82 @@ jobs:
           path: |
             installer/target/**/release/bundle/nsis/*.exe
             installer/target/**/release/bundle/nsis/*.nsis.zip*
+          retention-days: 7
+
+  release-build-macos:
+    name: macOS universal app
+    # Same triggers as the Windows job, but it runs *after* it: tauri-action
+    # merges each platform into the release's single `latest.json`, and two
+    # concurrent jobs rewriting that asset would lose one of the platforms.
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    needs: [core-tests, release-build]
+    runs-on: macos-latest
+    # `secrets` is not available in a step-level `if`, so the presence checks are
+    # hoisted here (job-level env *can* read secrets) and the steps test these.
+    env:
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
+      HAS_APPLE_NOTARIZATION: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_ID != '' }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Both halves of the universal binary.
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: installer
+          key: macos-release
+      - uses: oven-sh/setup-bun@v2
+      - name: Frontend install
+        working-directory: installer
+        run: bun install
+
+      # Signing is optional: with no Apple Developer secrets configured the app
+      # is built unsigned and users get the Gatekeeper right-click → Open dance.
+      # The vars must stay *unset* rather than empty — the bundler treats an
+      # empty APPLE_CERTIFICATE as "sign with this", which fails the build.
+      - name: Enable Apple code signing
+        if: env.HAS_APPLE_CERT == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          for var in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY; do
+            printf '%s<<__EOF__\n%s\n__EOF__\n' "$var" "${!var}" >> "$GITHUB_ENV"
+          done
+      - name: Enable notarization
+        if: env.HAS_APPLE_NOTARIZATION == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for var in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            printf '%s<<__EOF__\n%s\n__EOF__\n' "$var" "${!var}" >> "$GITHUB_ENV"
+          done
+
+      # Builds the universal .app + .dmg, signs the updater bundle, and merges
+      # the darwin-aarch64 / darwin-x86_64 entries into the release's latest.json.
+      - name: Build and compile (Tauri Action)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: installer
+          tagName: ${{ github.event.release.tag_name }}
+          releaseId: ${{ github.event.release.id }}
+          args: --target universal-apple-darwin
+          includeUpdaterJson: true
+
+      - name: Upload macOS Build Artifacts
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-installer-universal
+          path: |
+            installer/target/**/release/bundle/dmg/*.dmg
+            installer/target/**/release/bundle/macos/*.app.tar.gz*
           retention-days: 7

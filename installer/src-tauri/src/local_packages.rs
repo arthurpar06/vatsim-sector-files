@@ -47,6 +47,19 @@ pub fn extract_package(path: &Path) -> anyhow::Result<LocalPackage> {
         other => anyhow::bail!("unsupported package type '.{other}' (expected .zip or .7z)"),
     }
 
+    // GNG archives are built on Windows and sometimes carry `\`-separated entry
+    // names. Those only split into directories when extracted *on* Windows, so
+    // off Windows the tree has to be rebuilt before the planner walks it.
+    let moved = controller_pack_core::archive_paths::normalize_windows_separators(tmp.path())
+        .with_context(|| format!("normalizing entry names of {}", path.display()))?;
+    if moved > 0 {
+        tracing::debug!(
+            archive = %path.display(),
+            moved,
+            "rebuilt Windows-style archive entry names"
+        );
+    }
+
     let root = tmp.path().to_path_buf();
     Ok(LocalPackage { _tmp: tmp, root })
 }

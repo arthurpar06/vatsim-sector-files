@@ -1,7 +1,7 @@
 use super::airac::{leading_combined_code, parse_gng_sector_target, LFXXN_CODE};
 use super::ownership::{gng_owned_set, is_gng_owned};
 use super::{COPYRIGHT_FILE, CURRENT_AIRAC_FILE, SECTORS_SUBPATH, SECTOR_BACKUP_DIRNAME};
-use crate::fir::FirCode;
+use crate::fir::{AreaCode, FirCode};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -15,8 +15,8 @@ pub enum FileOp {
     /// Move an existing installed sector file to the backup directory before
     /// writing a new one in its place.
     BackupSector { src: PathBuf, dst: PathBuf },
-    /// Write a sector file to its canonical location, renamed to <FIR>.<ext>.
-    WriteSector { src: PathBuf, dst: PathBuf, fir: FirCode, ext: SectorExt },
+    /// Write a sector file to its canonical location, renamed to <AREA>.<ext>.
+    WriteSector { src: PathBuf, dst: PathBuf, area: AreaCode, ext: SectorExt },
     /// Move a `.prf` file to the FIR folder root.
     MoveProfile { src: PathBuf, dst: PathBuf },
     /// Write/overwrite a marker text file with a given string value.
@@ -72,9 +72,10 @@ pub struct SyncSummary {
     pub warnings: Vec<String>,
 }
 
-/// The legacy/Tier-2 "secret" area folder. It lives on GitHub but is only
-/// installed when a matching package is selected (see `detect_installed_codes`).
-pub const LFFM_CODE: &str = "LFFM";
+// The military/legacy Tier-2 "secret" area folder. It lives on GitHub but is
+// only installed when a matching package is selected (see
+// `detect_installed_codes`).
+pub use crate::fir::LFFM_CODE;
 
 /// How the set of areas (FIR folders + LFFM) to install is determined.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -164,8 +165,8 @@ fn detect_installed_areas_on_disk(install_root: &Path) -> (BTreeSet<FirCode>, bo
     (firs, lffm)
 }
 
-/// If `rel` is `<FIR>/ICAO/…` or `<FIR>/NavData/…`, the equivalent path under
-/// `LFXX` (CoFrance reads ICAO/NavData from `LFXX`, not the per-FIR folder).
+/// If `rel` is `<AREA>/ICAO/…` or `<AREA>/NavData/…`, the equivalent path under
+/// `LFXX` (CoFrance reads ICAO/NavData from `LFXX`, not the per-area folder).
 fn mirror_navdata_to_lfxx(rel: &Path) -> Option<PathBuf> {
     let parts: Vec<_> = rel.iter().collect();
     if parts.len() < 2 {
@@ -173,9 +174,9 @@ fn mirror_navdata_to_lfxx(rel: &Path) -> Option<PathBuf> {
     }
     let first = parts[0].to_string_lossy();
     let second = parts[1].to_string_lossy();
-    let is_fir = first.parse::<FirCode>().is_ok();
+    let is_area = first.parse::<AreaCode>().is_ok();
     let is_navdata = second.eq_ignore_ascii_case("ICAO") || second.eq_ignore_ascii_case("NavData");
-    if is_fir && is_navdata {
+    if is_area && is_navdata {
         let tail: PathBuf = parts[1..].iter().collect();
         Some(Path::new("LFXX").join(tail))
     } else {
@@ -228,7 +229,7 @@ pub fn plan(inputs: PlanInputs<'_>) -> anyhow::Result<SyncPlan> {
     //    writes are collected separately so they can be ordered AFTER their
     //    matching BackupSector ops in step 3.
     let mut sector_writes: Vec<FileOp> = Vec::new();
-    let mut sector_targets: BTreeSet<(FirCode, SectorExt)> = BTreeSet::new();
+    let mut sector_targets: BTreeSet<(AreaCode, SectorExt)> = BTreeSet::new();
     for gng_root in inputs.gng_roots {
         plan_gng_overlay(
             gng_root,
@@ -241,9 +242,9 @@ pub fn plan(inputs: PlanInputs<'_>) -> anyhow::Result<SyncPlan> {
 
     // Filter no-op sector writes (src content matches the file already at dst).
     sector_writes.retain(|op| match op {
-        FileOp::WriteSector { src, dst, fir, ext } => {
+        FileOp::WriteSector { src, dst, area, ext } => {
             if files_equal(src, dst) {
-                sector_targets.remove(&(*fir, *ext));
+                sector_targets.remove(&(*area, *ext));
                 false
             } else {
                 true
@@ -388,7 +389,7 @@ fn plan_gng_overlay(
     install_root: &Path,
     plan: &mut SyncPlan,
     sector_writes: &mut Vec<FileOp>,
-    sector_targets: &mut BTreeSet<(FirCode, SectorExt)>,
+    sector_targets: &mut BTreeSet<(AreaCode, SectorExt)>,
 ) {
     let sectors_dir = install_root.join(SECTORS_SUBPATH);
 
@@ -402,39 +403,39 @@ fn plan_gng_overlay(
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase());
 
-        // Sector files: rename to <FIR>.<ext>, place in LFXX/Sectors/. A combined
-        // code (e.g. LFXXN) fans the single source file out to one renamed sector
-        // per covered FIR.
+        // Sector files: rename to <AREA>.<ext>, place in LFXX/Sectors/. A
+        // combined code (e.g. LFXXN) fans the single source file out to one
+        // renamed sector per covered FIR.
         if let Some(ext) = ext.as_deref().and_then(SectorExt::from_str) {
-            if let Some((firs, cycle)) = parse_gng_sector_target(&name) {
+            if let Some((areas, cycle)) = parse_gng_sector_target(&name) {
                 if let Some(c) = cycle.clone() {
                     plan.detected_airac = Some(c);
                 }
-                for fir in firs {
-                    let dst = sectors_dir.join(format!("{}.{}", fir.as_str(), ext.as_str()));
+                for area in areas {
+                    let dst = sectors_dir.join(format!("{}.{}", area.as_str(), ext.as_str()));
                     sector_writes.push(FileOp::WriteSector {
                         src: path.to_path_buf(),
                         dst,
-                        fir,
+                        area,
                         ext,
                     });
-                    sector_targets.insert((fir, ext));
+                    sector_targets.insert((area, ext));
                 }
                 continue;
             }
-            // Not a FIR sector filename — skip (e.g. sub-sector includes). This
+            // Not an area sector filename — skip (e.g. sub-sector includes). This
             // is expected, so it's a diagnostic note rather than a warning.
             plan.notes
-                .push(format!("Ignored non-FIR sector file: {}", name));
+                .push(format!("Ignored non-area sector file: {}", name));
             continue;
         }
 
-        // `.rwy` files: keep, paired with the sector dir as <FIR>.rwy. A combined
+        // `.rwy` files: keep, paired with the sector dir as <AREA>.rwy. A combined
         // code fans the single source out to one <FIR>.rwy per covered FIR.
         if ext.as_deref() == Some("rwy") {
-            if let Some((firs, _)) = parse_gng_sector_target(&name) {
-                for fir in firs {
-                    let dst = sectors_dir.join(format!("{}.rwy", fir.as_str()));
+            if let Some((areas, _)) = parse_gng_sector_target(&name) {
+                for area in areas {
+                    let dst = sectors_dir.join(format!("{}.rwy", area.as_str()));
                     plan.ops.push(FileOp::Copy {
                         src: path.to_path_buf(),
                         dst,
@@ -471,13 +472,18 @@ fn plan_gng_overlay(
 }
 
 /// Returns the destination-relative path(s) for a GNG file, anchored at the
-/// first FIR / LFXX / combined-code segment encountered in the package.
+/// first area / LFXX / combined-code segment encountered in the package.
 ///
 /// Most files yield a single destination. A combined `LFXXN` segment fans the
 /// file out to BOTH covered FIRs (LFFF + LFEE) — the same way the combined
 /// sector file is written once per FIR — so its `ICAO`/`NavData` and
 /// `Settings/VoiceChannels.txt` land under each FIR folder. Returns an empty
 /// vec when no anchor segment exists.
+///
+/// `LFFM` anchors like any other area (it is not rewritten into `LFXX`): its
+/// `.prf` reads `\ICAO\…` / `\NavData\…` relative to its own folder, exactly as
+/// each FIR's does. The `LFXX` copy CoFrance reads still gets written, via
+/// [`mirror_navdata_to_lfxx`].
 fn locate_inside_fir_or_lfxx(gng_root: &Path, path: &Path) -> Vec<PathBuf> {
     let Ok(rel) = path.strip_prefix(gng_root) else {
         return Vec::new();
@@ -487,7 +493,7 @@ fn locate_inside_fir_or_lfxx(gng_root: &Path, path: &Path) -> Vec<PathBuf> {
         let segment = part.to_string_lossy();
         let upper = segment.to_ascii_uppercase();
 
-        if upper == "LFXX" || FirCode::ALL.iter().any(|fir| fir.as_str() == upper.as_str()) {
+        if upper == "LFXX" || upper.parse::<AreaCode>().is_ok() {
             let tail: PathBuf = parts[idx..].iter().collect();
             return vec![tail];
         }
@@ -502,22 +508,13 @@ fn locate_inside_fir_or_lfxx(gng_root: &Path, path: &Path) -> Vec<PathBuf> {
                 .map(|fir| Path::new(fir.as_str()).join(&tail))
                 .collect();
         }
-
-        if upper == "LFFM" {
-            // Legacy: rewrite LFFM into LFXX.
-            let mut p = PathBuf::from("LFXX");
-            for tail_part in &parts[idx + 1..] {
-                p.push(tail_part);
-            }
-            return vec![p];
-        }
     }
     Vec::new()
 }
 
 fn plan_sector_backups(
     install_root: &Path,
-    sector_targets: &BTreeSet<(FirCode, SectorExt)>,
+    sector_targets: &BTreeSet<(AreaCode, SectorExt)>,
     previous_airac: Option<&str>,
     plan: &mut SyncPlan,
 ) {
@@ -528,16 +525,17 @@ fn plan_sector_backups(
         path: backup_dir.clone(),
     });
 
-    for (fir, ext) in sector_targets {
-        let existing = sectors_dir.join(format!("{}.{}", fir.as_str(), ext.as_str()));
+    for (area, ext) in sector_targets {
+        let existing = sectors_dir.join(format!("{}.{}", area.as_str(), ext.as_str()));
         if existing.exists() {
             let cycle = previous_airac.unwrap_or("unknown");
-            let mut backup = backup_dir.join(format!("{}-{}.{}", fir.as_str(), cycle, ext.as_str()));
+            let mut backup =
+                backup_dir.join(format!("{}-{}.{}", area.as_str(), cycle, ext.as_str()));
             if backup.exists() {
                 let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
                 backup = backup_dir.join(format!(
                     "{}-{}_{}.{}",
-                    fir.as_str(),
+                    area.as_str(),
                     cycle,
                     ts,
                     ext.as_str()

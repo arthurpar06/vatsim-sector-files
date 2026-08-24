@@ -117,11 +117,13 @@ fn atomic_copy(src: &Path, dst: &Path) -> io::Result<()> {
     ));
     fs::copy(src, &tmp)?;
     if let Err(e) = fs::rename(&tmp, dst) {
-        // On Windows, rename across the same dir works; if rename fails (e.g.
-        // dst exists with file lock), fall back to direct copy.
+        // Rename within a directory is atomic on every platform we ship, but it
+        // can still fail (a locked destination on Windows, a filesystem that
+        // refuses the rename). Falling back to a direct copy loses atomicity,
+        // not correctness — so it is a success, not an error.
+        tracing::debug!(dst = %dst.display(), error = %e, "atomic rename failed; copying in place");
         fs::copy(src, dst)?;
         let _ = fs::remove_file(&tmp);
-        return Err(e);
     }
     Ok(())
 }
@@ -130,9 +132,9 @@ fn atomic_write(dst: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = dst.with_extension("partial.tmp");
     fs::write(&tmp, bytes)?;
     if let Err(e) = fs::rename(&tmp, dst) {
+        tracing::debug!(dst = %dst.display(), error = %e, "atomic rename failed; writing in place");
         fs::write(dst, bytes)?;
         let _ = fs::remove_file(&tmp);
-        return Err(e);
     }
     Ok(())
 }

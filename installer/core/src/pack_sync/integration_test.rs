@@ -99,6 +99,24 @@ fn build_fake_lfxxn_package() -> (TempDir, PathBuf) {
     (tmp, root)
 }
 
+/// The LFFM ("military / legacy") package. LFFM is not an ICAO FIR, but its area
+/// folder is shaped exactly like a FIR's: `CoFrance LFFM.prf` reads
+/// `\..\LFXX\Sectors\LFFM.sct` plus its own `\ICAO\…` / `\NavData\…`. Uses the
+/// real GNG filename shape, with an `_`-prefixed creation timestamp before the
+/// `-260801-` AIRAC group.
+fn build_fake_lffm_package() -> (TempDir, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    write_file(&root, "LFFM-Military_20260807195057-260801-0001.sct", "military sct\n");
+    write_file(&root, "LFFM-Military_20260807195057-260801-0001.ese", "military ese\n");
+    write_file(&root, "LFFM-Military_20260807195057-260801-0001.rwy", "military rwy\n");
+    write_file(&root, "LFFM/ICAO/airports.txt", "lffm airports\n");
+    write_file(&root, "LFFM/NavData/airways.txt", "lffm navdata\n");
+
+    (tmp, root)
+}
+
 fn build_existing_install() -> TempDir {
     let tmp = TempDir::new().unwrap();
     let install_root = tmp.path();
@@ -311,6 +329,60 @@ fn lffm_is_installed_when_its_package_is_present() {
         files.contains(&"LFFM/Secret.txt".to_string()),
         "LFFM GitHub folder should be installed when its package is present; got: {files:#?}"
     );
+}
+
+#[test]
+fn lffm_package_installs_its_sector_files() {
+    let (_gh_tmp, github_root) = build_fake_github_repo();
+    let (_pkg_tmp, pkg_root) = build_fake_lffm_package();
+    let install_tmp = TempDir::new().unwrap();
+    let install_root = install_tmp.path();
+
+    let gng_roots = vec![pkg_root.clone()];
+    let summary = apply(
+        install_root,
+        &plan(PlanInputs {
+            github_root: Some(&github_root),
+            gng_roots: &gng_roots,
+            install_root,
+            github_short_sha: Some("abcdef1".into()),
+            area_source: AreaSource::Packages,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let files = list_files(install_root);
+
+    // LFFM owns a sector file exactly like a FIR does — its .prf points at
+    // `\..\LFXX\Sectors\LFFM.sct`.
+    assert!(
+        files.contains(&"LFXX/Sectors/LFFM.sct".to_string()),
+        "got: {files:#?}"
+    );
+    assert!(
+        files.contains(&"LFXX/Sectors/LFFM.ese".to_string()),
+        "got: {files:#?}"
+    );
+    assert!(
+        files.contains(&"LFXX/Sectors/LFFM.rwy".to_string()),
+        "got: {files:#?}"
+    );
+    assert_eq!(summary.airac_cycle.as_deref(), Some("2608"));
+
+    // ICAO/NavData land in LFFM's own folder (its .prf reads `\ICAO\…`) and are
+    // mirrored into LFXX like every other area's.
+    assert!(
+        files.contains(&"LFFM/ICAO/airports.txt".to_string()),
+        "got: {files:#?}"
+    );
+    assert!(
+        files.contains(&"LFXX/ICAO/airports.txt".to_string()),
+        "got: {files:#?}"
+    );
+
+    // Its GitHub overlay is installed, since the package selects the area.
+    assert!(files.contains(&"LFFM/Secret.txt".to_string()), "got: {files:#?}");
 }
 
 #[test]
